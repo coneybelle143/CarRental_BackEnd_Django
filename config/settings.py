@@ -32,6 +32,7 @@ ALLOWED_HOSTS = ['*'] if DEBUG else ['127.0.0.1', 'localhost']
 # Application definition
 
 INSTALLED_APPS = [
+    'daphne',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -40,6 +41,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'corsheaders',
     'rest_framework',
+    'channels',
     'api',
 ]
 
@@ -145,6 +147,8 @@ CORS_ALLOWED_ORIGINS = [
     "http://127.0.0.1:5173",
     "http://127.0.0.1:8080",
     "http://127.0.0.1:8081",
+    # LAN / device testing (Expo / Android)
+    "http://192.168.248.220:8000",
 ]
 
 CSRF_TRUSTED_ORIGINS = [
@@ -156,9 +160,20 @@ CSRF_TRUSTED_ORIGINS = [
     "http://127.0.0.1:5173",
     "http://127.0.0.1:8080",
     "http://127.0.0.1:8081",
+    # LAN / device testing (Expo / Android)
+    "http://192.168.248.220:8000",
 ]
+
 
 SESSION_COOKIE_SAMESITE = 'Lax'
 SESSION_COOKIE_HTTPONLY = True
 CSRF_COOKIE_SAMESITE = 'Lax'
 CSRF_COOKIE_HTTPONLY = False  # Must be readable by JS to send in headers
+
+ASGI_APPLICATION = 'config.asgi.application'
+
+CHANNEL_LAYERS = {
+    "default": {
+        "BACKEND": "channels.layers.InMemoryChannelLayer",
+    },
+}
