@@ -60,11 +60,28 @@ class ApiEndpointTests(APITestCase):
 			password='strongpass123',
 		)
 
+		owner = User.objects.create_user(
+			username='owner_student6',
+			email='owner_student6@example.com',
+			password='strongpass123',
+		)
+		car = None
+		# Ensure vehicleId=1 resolves by creating a real car with id=1.
+		car = Car.objects.create(
+			owner=owner,
+			brand='Toyota',
+			model='Vios',
+			year=2022,
+			daily_rate='1500.00',
+			available=True,
+		)
+
 		booking_response = self.client.post(
 			'/api/bookings/',
 			{
-				'vehicleId': 1,
+				'vehicleId': car.id,
 				'renterId': user.id,
+				'ownerId': owner.id,
 				'status': 'pending',
 			},
 			format='json',
@@ -80,11 +97,20 @@ class ApiEndpointTests(APITestCase):
 		)
 		self.assertEqual(booking_patch.status_code, status.HTTP_200_OK)
 
+		# When booking becomes approved, backend should auto-create a checkin log.
+		self.assertEqual(LogReport.objects.count(), 1)
+		self.assertTrue(LogReport.objects.filter(
+			rental_id=Booking.objects.get(id=booking_id).rental_id,
+			report_type='checkin',
+			reporter_id=user.id,
+			vehicle_id=car.id,
+		).exists())
+
 		report_response = self.client.post(
 			'/api/log-reports/',
 			{
 				'type': 'checkin',
-				'vehicleId': 1,
+				'vehicleId': car.id,
 				'reporterId': user.id,
 				'issues': [],
 				'notes': 'ok',
@@ -92,7 +118,6 @@ class ApiEndpointTests(APITestCase):
 			format='json',
 		)
 		self.assertEqual(report_response.status_code, status.HTTP_201_CREATED)
-		self.assertEqual(LogReport.objects.count(), 1)
 
 		email_response = self.client.post(
 			'/api/email-logs/',
@@ -106,6 +131,71 @@ class ApiEndpointTests(APITestCase):
 		)
 		self.assertEqual(email_response.status_code, status.HTTP_201_CREATED)
 		self.assertEqual(EmailLog.objects.count(), 1)
+
+	def test_cannot_checkout_without_return_accepted(self):
+		user = User.objects.create_user(
+			username='student_check',
+			email='student_check@example.com',
+			password='strongpass123',
+		)
+		owner = User.objects.create_user(
+			username='owner_check',
+			email='owner_check@example.com',
+			password='strongpass123',
+		)
+		car = Car.objects.create(
+			owner=owner,
+			brand='Toyota',
+			model='Vios',
+			year=2022,
+			daily_rate='1500.00',
+			available=True,
+		)
+
+		booking = Booking.objects.create(
+			renter=user,
+			owner=owner,
+			vehicle=car,
+			status='approved',
+			rental_id='RNT-checkout-1',
+		)
+
+		# Create a checkin log (the checkout will be attempted via PATCH later)
+		log = LogReport.objects.create(
+			reporter=user,
+			vehicle=car,
+			rental_id=booking.rental_id,
+			report_type='checkin',
+			data={},
+		)
+
+		# Attempt to add checkout without having a return_accepted log => should fail.
+		resp = self.client.patch(
+			f'/api/log-reports/{log.id}/',
+			{'checkout': {'odometer': 123}},
+			format='json',
+		)
+		self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+		self.assertIn('detail', resp.data)
+		self.assertIn('return vehicle is accepted', resp.data['detail'])
+
+		# Now create the required return_accepted log.
+		LogReport.objects.create(
+			reporter=owner,
+			vehicle=car,
+			rental_id=booking.rental_id,
+			report_type='return_accepted',
+			data={},
+		)
+
+		# Should succeed now.
+		resp2 = self.client.patch(
+			f'/api/log-reports/{log.id}/',
+			{'checkout': {'odometer': 124}},
+			format='json',
+		)
+		self.assertEqual(resp2.status_code, status.HTTP_200_OK)
+
 
 	def test_booking_invalid_renter_id_returns_400(self):
 		response = self.client.post(
