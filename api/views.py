@@ -1,4 +1,6 @@
 import logging
+from asgiref.sync import async_to_sync
+from channels.layers import get_channel_layer
 from django.contrib.auth import authenticate, login
 from django.contrib.auth.models import User
 from django.shortcuts import get_object_or_404
@@ -21,15 +23,60 @@ from .serializers import (
 	UserUpdateSerializer,
 )
 
+def broadcast_sync_event(event_type, action, instance_id, payload):
+    """
+    Helper to send real-time updates to all connected clients via Django Channels.
+    """
+    channel_layer = get_channel_layer()
+    if channel_layer:
+        async_to_sync(channel_layer.group_send)(
+            "sync_group",
+            {
+                "type": "sync_event",
+                "data": {
+                    "type": event_type,
+                    "action": action,
+                    "id": str(instance_id),
+                    "payload": payload,
+                },
+            },
+        )
+
 
 class LoginView(APIView):
 	permission_classes = [permissions.AllowAny]
 	authentication_classes = []  # Bypass default auth to avoid CSRF check on login
 
+
 	def post(self, request):
-		email = request.data.get('email', '').strip().lower()
-		username = request.data.get('username', '').strip()
-		password = request.data.get('password', '')
+		# Support multiple payload shapes so mobile + frontend can both log in.
+		# Do NOT log/expose the password.
+		d = request.data or {}
+
+		# email aliases
+		email = (
+			(d.get('email') or d.get('Email') or d.get('emailAddress') or d.get('loginEmail') or '')
+			.strip()
+			.lower()
+		)
+		# username aliases
+		username = (
+			(d.get('username') or d.get('userName') or d.get('login') or d.get('user') or '')
+			.strip()
+		)
+		# password aliases
+		password = d.get('password') or d.get('pass') or d.get('Password') or ''
+
+
+		# Temporary debug info (helps identify why mobile fails)
+		debug_input_keys = sorted(list(d.keys()))
+		debug_has_email = bool(email)
+		debug_has_username = bool(username)
+
+		# (Optional) allow frontend/mobile to request debug details
+		want_debug = str(d.get('debug', '')).lower() in {'1', 'true', 'yes', 'y'}
+
+
 
 		if not password or (not email and not username):
 			return Response(
@@ -48,7 +95,32 @@ class LoginView(APIView):
 		if user is not None:
 			login(request, user)
 			return Response(UserSerializer(user).data)
+
+		# Debug payload: do not include password.
+		if want_debug:
+			candidate_email_user = None
+			candidate_username_user = None
+			if email:
+				candidate_email_user = User.objects.filter(email__iexact=email).first()
+			if username:
+				candidate_username_user = User.objects.filter(username__iexact=username).first()
+
+			return Response(
+				{
+					'detail': 'Invalid credentials.',
+					'inputKeys': debug_input_keys,
+					'emailProvided': debug_has_email,
+					'usernameProvided': debug_has_username,
+					'emailNormalized': email or None,
+					'usernameNormalized': username or None,
+					'emailUserExists': bool(candidate_email_user),
+					'usernameUserExists': bool(candidate_username_user),
+				},
+				status=status.HTTP_401_UNAUTHORIZED,
+			)
+
 		return Response({'detail': 'Invalid credentials.'}, status=status.HTTP_401_UNAUTHORIZED)
+
 
 
 class RegisterView(generics.CreateAPIView):
@@ -175,14 +247,119 @@ class BookingListCreateView(generics.ListCreateAPIView):
 		# This avoids a 400 when the client omits renterId but the user is logged in.
 		if getattr(self.request, 'user', None) and getattr(self.request.user, 'is_authenticated', False):
 			serializer.save(renter=self.request.user)
-			return
-		serializer.save()
+		else:
+			serializer.save()
+		
+		broadcast_sync_event(
+			'booking_created', 
+			'create', 
+			serializer.instance.id, 
+			BookingSerializer(serializer.instance).data
+		)
 
 
 class BookingDetailView(generics.RetrieveUpdateDestroyAPIView):
 	queryset = Booking.objects.select_related('renter', 'owner', 'vehicle').all()
 	serializer_class = BookingSerializer
 	permission_classes = [permissions.AllowAny]
+
+	def perform_update(self, serializer):
+		# Capture previous status so we only react to transitions.
+		instance = self.get_object()
+		previous_status = instance.status
+
+		instance = serializer.save()
+
+		# If booking is accepted/approved -> create a log-book entry (checkin)
+		# so “rental history” becomes available to the frontend.
+		accepted_statuses = {'accepted', 'approved'}
+		new_status = (instance.status or '').strip().lower()
+		prev = (previous_status or '').strip().lower()
+
+		if new_status in accepted_statuses and prev != new_status:
+			# Ensure booking.rental_id exists for linkage with LogReport.
+			if not instance.rental_id:
+				instance.rental_id = f"RNT-{instance.id}"
+				instance.save(update_fields=['rental_id'])
+
+			# Create checkin log if it doesn’t already exist.
+			if instance.vehicle_id and instance.renter_id:
+				from .models import LogReport
+				checkin_exists = LogReport.objects.filter(
+					rental_id=instance.rental_id,
+					report_type='checkin',
+					reporter_id=instance.renter_id,
+					vehicle_id=instance.vehicle_id,
+				).exists()
+
+				if not checkin_exists:
+					LogReport.objects.create(
+						reporter=instance.renter,
+						vehicle=instance.vehicle,
+						rental_id=instance.rental_id,
+						report_type='checkin',
+						data={
+							'bookingId': instance.id,
+							'bookingStatus': instance.status,
+							'start_date': instance.start_date,
+							'end_date': instance.end_date,
+							'amount': str(instance.amount) if instance.amount is not None else None,
+						},
+						checkout=None,
+						comments=[],
+					)
+
+				
+			# When the owner accepts a return request, frontend needs to be able to
+			# checkout the vehicle after trip.
+			# This is blocked by LogReportDetailView unless a matching
+			# `return_accepted` LogReport exists (same rental_id + vehicle_id).
+			#
+			# We create that log here when booking status transitions to completed-
+			# style states. Adjust these statuses to match your UI.
+			return_accepted_statuses = {'return_accepted', 'returnaccepted', 'returned', 'completed'}
+			if new_status in return_accepted_statuses and prev != new_status:
+				from .models import LogReport
+				if instance.vehicle_id and instance.owner_id:
+					# renter/owner choice: most flows use owner as reporter for return acceptance.
+					return_accepted_exists = LogReport.objects.filter(
+						rental_id=instance.rental_id,
+						report_type='return_accepted',
+						vehicle_id=instance.vehicle_id,
+					).exists()
+
+					if not return_accepted_exists:
+						LogReport.objects.create(
+							reporter=instance.owner,
+							vehicle=instance.vehicle,
+							rental_id=instance.rental_id or f"RNT-{instance.id}",
+							report_type='return_accepted',
+							data={
+								'bookingId': instance.id,
+								'bookingStatus': instance.status,
+							},
+							checkout=None,
+							comments=[],
+						)
+
+		broadcast_sync_event(
+			'booking_updated',
+			'update',
+			instance.id,
+			BookingSerializer(instance).data
+		)
+
+
+	def perform_destroy(self, instance):
+		instance_id = instance.id
+		instance.delete()
+		broadcast_sync_event(
+			'booking_deleted', 
+			'delete', 
+			instance_id, 
+			None
+		)
+
 
 
 class LogReportListCreateView(generics.ListCreateAPIView):
@@ -212,8 +389,15 @@ class LogReportListCreateView(generics.ListCreateAPIView):
 		# If authenticated, use the requesting user as the reporter.
 		if getattr(self.request, 'user', None) and getattr(self.request.user, 'is_authenticated', False):
 			serializer.save(reporter=self.request.user)
-			return
-		serializer.save()
+		else:
+			serializer.save()
+
+		broadcast_sync_event(
+			'logreport_created', 
+			'create', 
+			serializer.instance.id, 
+			LogReportSerializer(serializer.instance).data
+		)
 
 
 class LogReportDetailView(generics.RetrieveUpdateDestroyAPIView):
@@ -227,9 +411,24 @@ class LogReportDetailView(generics.RetrieveUpdateDestroyAPIView):
 		instance = self.get_object()
 		validated_data = serializer.validated_data
 
-		# Check if checkout data is being added and booking should be auto-completed
-		if 'checkout' in validated_data and validated_data['checkout'] and instance.rental_id:
-			# Find the related booking and mark it as completed
+		# BLOCK: checkout can only be added/changed after the owner accepted the return.
+		if 'checkout' in validated_data and validated_data.get('checkout'):
+			# If this update is trying to set checkout while no return_accepted exists, reject.
+			if instance.rental_id and instance.vehicle_id:
+				return_accepted_exists = LogReport.objects.filter(
+					rental_id=instance.rental_id,
+					report_type='return_accepted',
+					vehicle_id=instance.vehicle_id,
+				).exists()
+				# If there is no return acceptance, forbid checkout.
+				if not return_accepted_exists:
+					from rest_framework.exceptions import ValidationError
+					raise ValidationError({
+						'detail': 'You cannot add check-out until the return vehicle is accepted.'
+					})
+
+		# If checkout is being set, mark booking as completed (best-effort)
+		if 'checkout' in validated_data and validated_data.get('checkout') and instance.rental_id:
 			from .models import Booking
 			try:
 				booking = Booking.objects.filter(rental_id=instance.rental_id).first()
@@ -237,12 +436,29 @@ class LogReportDetailView(generics.RetrieveUpdateDestroyAPIView):
 					booking.status = 'completed'
 					booking.save(update_fields=['status', 'updated_at'])
 			except Exception as e:
-				# Log error but don't fail the checkout creation
 				import logging
 				logger = logging.getLogger(__name__)
 				logger.warning(f'Failed to auto-complete booking for rental_id {instance.rental_id}: {e}')
 
-		return super().perform_update(serializer)
+		instance = serializer.save()
+		broadcast_sync_event(
+			'logreport_updated',
+			'update',
+			instance.id,
+			LogReportSerializer(instance).data
+		)
+
+
+	def perform_destroy(self, instance):
+		instance_id = instance.id
+		instance.delete()
+		broadcast_sync_event(
+			'logreport_deleted', 
+			'delete', 
+			instance_id, 
+			None
+		)
+
 
 
 class EmailLogListCreateView(generics.ListCreateAPIView):
@@ -309,42 +525,45 @@ class CarListCreateView(generics.ListCreateAPIView):
 		logger.warning('Car create attempt: user=%s authenticated=%s auth=%s data=%s',
 					   user, bool(user and getattr(user, 'is_authenticated', False)), auth, data)
 
+		instance = None
 		if self.request.user and self.request.user.is_authenticated:
-			serializer.save(owner=self.request.user)
-			return
-
-		owner_candidate = None
-		try:
-			owner_candidate = (
-				self.request.data.get('owner')
-				or self.request.data.get('ownerId')
-				or self.request.data.get('owner_id')
-				or self.request.data.get('user')
-				or self.request.data.get('user_id')
-				or self.request.data.get('ownerEmail')
-				or self.request.data.get('owner_email')
-			)
-		except Exception:
+			instance = serializer.save(owner=self.request.user)
+		else:
 			owner_candidate = None
-
-		owner_obj = None
-		if owner_candidate:
 			try:
-				cand = str(owner_candidate).strip()
-				if cand.isdigit():
-					owner_obj = User.objects.filter(pk=int(cand)).first()
-				elif '@' in cand:
-					owner_obj = User.objects.filter(email__iexact=cand).first()
-				else:
-					owner_obj = User.objects.filter(username__iexact=cand).first()
+				owner_candidate = (
+					self.request.data.get('owner')
+					or self.request.data.get('ownerId')
+					or self.request.data.get('owner_id')
+				)
 			except Exception:
-				owner_obj = None
+				owner_candidate = None
 
-		if owner_obj:
-			serializer.save(owner=owner_obj)
-			return
+			owner_obj = None
+			if owner_candidate:
+				try:
+					cand = str(owner_candidate).strip()
+					if cand.isdigit():
+						owner_obj = User.objects.filter(pk=int(cand)).first()
+					elif '@' in cand:
+						owner_obj = User.objects.filter(email__iexact=cand).first()
+					else:
+						owner_obj = User.objects.filter(username__iexact=cand).first()
+				except Exception:
+					owner_obj = None
 
-		serializer.save()
+			if owner_obj:
+				instance = serializer.save(owner=owner_obj)
+			else:
+				instance = serializer.save()
+
+		broadcast_sync_event(
+			'vehicle_created', 
+			'create', 
+			instance.id, 
+			CarSerializer(instance).data
+		)
+
 
 
 class CarDetailView(generics.RetrieveUpdateDestroyAPIView):
@@ -355,6 +574,25 @@ class CarDetailView(generics.RetrieveUpdateDestroyAPIView):
 
 	def get_queryset(self):
 		return Car.objects.select_related('owner').all()
+
+	def perform_update(self, serializer):
+		instance = serializer.save()
+		broadcast_sync_event(
+			'vehicle_updated', 
+			'update', 
+			instance.id, 
+			CarSerializer(instance).data
+		)
+
+	def perform_destroy(self, instance):
+		instance_id = instance.id
+		instance.delete()
+		broadcast_sync_event(
+			'vehicle_deleted', 
+			'delete', 
+			instance_id, 
+			None
+		)
 
 
 class HealthCheckView(APIView):
