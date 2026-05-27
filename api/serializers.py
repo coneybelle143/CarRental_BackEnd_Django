@@ -408,6 +408,20 @@ class BookingSerializer(serializers.Serializer):
         if not owner and vehicle:
             owner = vehicle.owner
 
+        # Ensure JSONField `data` is JSON serializable.
+        # Some clients may send model instances (e.g., User) inside `data`.
+        # Strip them out to avoid: TypeError: Object of type User is not JSON serializable
+        def _sanitize_for_json(value):
+            if isinstance(value, User):
+                return {'id': value.id, 'username': value.username, 'email': value.email}
+            if isinstance(value, dict):
+                return {k: _sanitize_for_json(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [_sanitize_for_json(v) for v in value]
+            return value
+
+        safe_data = _sanitize_for_json(data)
+
         return Booking.objects.create(
             renter=renter,
             owner=owner,
@@ -417,7 +431,7 @@ class BookingSerializer(serializers.Serializer):
             start_date=start_date,
             end_date=end_date,
             amount=amount,
-            data=data,
+            data=safe_data,
         )
 
     def update(self, instance, validated_data):
